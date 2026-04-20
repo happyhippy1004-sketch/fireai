@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 anthropic
-chromadb
+chromadb-client
 pdfplumber
-sentence-transformers
 python-multipart

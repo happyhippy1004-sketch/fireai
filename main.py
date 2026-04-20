@@ -37,7 +37,7 @@ TOP_K = 5
 client_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+embedding_fn = embedding_functions.DefaultEmbeddingFunction()
     model_name="paraphrase-multilingual-MiniLM-L12-v2"
 )
 collection = chroma_client.get_or_create_collection(
