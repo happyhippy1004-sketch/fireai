@@ -1,4 +1,3 @@
-# 소방 AI 참모 백엔드 의존성
 fastapi
 uvicorn
 anthropic
