@@ -1,6 +1,6 @@
 """
 소방 현장지휘 AI 참모 - 백엔드 서버
-FastAPI + ChromaDB + Claude API (RAG 구조)
+FastAPI + ChromaDB (인메모리) + Claude API
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import anthropic
 import chromadb
-from chromadb.utils import embedding_functions
 import pdfplumber
 import hashlib
 import os
@@ -25,18 +24,16 @@ app.add_middleware(
 )
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")
-CHROMA_PATH = "./chroma_db"
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 TOP_K = 5
 
 client_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-embedding_fn = embedding_functions.DefaultEmbeddingFunction()
+# 인메모리 ChromaDB (Railway 클라우드용)
+chroma_client = chromadb.EphemeralClient()
 collection = chroma_client.get_or_create_collection(
     name="fire_manuals",
-    embedding_function=embedding_fn,
     metadata={"hnsw:space": "cosine"}
 )
 
@@ -113,58 +110,57 @@ def root():
     }
 
 
-@app.get("/reload-manuals")
-def reload_manuals():
-    manual_dir = Path("./manuals")
-    if not manual_dir.exists():
-        manual_dir.mkdir()
-        return {"message": "manuals 폴더를 새로 만들었습니다.", "results": []}
+@app.post("/upload-manual")
+async def upload_manual(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다")
 
-    pdf_files = list(manual_dir.glob("*.pdf"))
-    if not pdf_files:
-        return {"message": "PDF 파일이 없습니다.", "results": []}
+    pdf_bytes = await file.read()
+    file_hash = hashlib.md5(pdf_bytes).hexdigest()[:8]
+    text = extract_text_from_pdf(pdf_bytes)
 
-    results = []
-    for pdf_file in pdf_files:
-        try:
-            pdf_bytes = pdf_file.read_bytes()
-            file_hash = hashlib.md5(pdf_bytes).hexdigest()[:8]
-            text = extract_text_from_pdf(pdf_bytes)
-            if not text.strip():
-                results.append({"file": pdf_file.name, "status": "텍스트 추출 실패"})
-                continue
-            chunks = split_into_chunks(text)
-            try:
-                collection.delete(where={"file_hash": file_hash})
-            except:
-                pass
-            ids = [f"{file_hash}_{i}" for i in range(len(chunks))]
-            metadatas = [{"source": pdf_file.name, "chunk_index": i, "file_hash": file_hash} for i in range(len(chunks))]
-            collection.add(documents=chunks, ids=ids, metadatas=metadatas)
-            results.append({"file": pdf_file.name, "chunks": len(chunks), "status": "등록완료"})
-        except Exception as e:
-            results.append({"file": pdf_file.name, "status": f"오류: {str(e)}"})
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="텍스트 추출 실패")
 
-    return {"results": results, "total": len(results), "total_chunks": collection.count()}
+    chunks = split_into_chunks(text)
+
+    try:
+        collection.delete(where={"file_hash": file_hash})
+    except:
+        pass
+
+    ids = [f"{file_hash}_{i}" for i in range(len(chunks))]
+    metadatas = [{"source": file.filename, "chunk_index": i, "file_hash": file_hash} for i in range(len(chunks))]
+    collection.add(documents=chunks, ids=ids, metadatas=metadatas)
+
+    return {"status": "등록완료", "filename": file.filename, "chunks": len(chunks)}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     sources = search_manuals(req.message)
     manual_found = len(sources) > 0 and sources[0]["relevance"] > 0.5
+
     context = ""
     if sources:
         context = "\n\n[참조 매뉴얼]\n"
         for i, s in enumerate(sources, 1):
             context += f"\n{i}. 출처: {s['source']} (관련도: {s['relevance']})\n{s['text']}\n"
+
     messages = req.history + [{"role": "user", "content": context + "\n\n질문: " + req.message}]
+
     response = client_anthropic.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1500,
         system=SYSTEM_PROMPT,
         messages=messages
     )
-    return ChatResponse(answer=response.content[0].text, sources=sources[:3], manual_found=manual_found)
+
+    return ChatResponse(
+        answer=response.content[0].text,
+        sources=sources[:3],
+        manual_found=manual_found
+    )
 
 
 @app.get("/manuals")
@@ -175,7 +171,7 @@ def list_manuals():
         for meta in all_items["metadatas"]:
             src = meta.get("source", "")
             if src not in seen:
-                seen[src] = {"filename": src, "chunks": 0, "hash": meta.get("file_hash", "")}
+                seen[src] = {"filename": src, "chunks": 0}
             seen[src]["chunks"] += 1
         return {"manuals": list(seen.values()), "total_chunks": collection.count()}
     except:
@@ -184,12 +180,15 @@ def list_manuals():
 
 @app.get("/export-cache")
 def export_cache():
-    all_items = collection.get(include=["documents", "metadatas"])
-    cache = {
-        "version": "1.0",
-        "chunks": [
-            {"id": all_items["ids"][i], "text": all_items["documents"][i], "source": all_items["metadatas"][i].get("source", "")}
-            for i in range(len(all_items["ids"]))
-        ]
-    }
-    return cache
+    try:
+        all_items = collection.get(include=["documents", "metadatas"])
+        cache = {
+            "version": "1.0",
+            "chunks": [
+                {"id": all_items["ids"][i], "text": all_items["documents"][i], "source": all_items["metadatas"][i].get("source", "")}
+                for i in range(len(all_items["ids"]))
+            ]
+        }
+        return cache
+    except:
+        return {"version": "1.0", "chunks": []}
